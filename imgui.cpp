@@ -1316,6 +1316,7 @@ static void             UpdateTexturesNewFrame();
 static void             UpdateTexturesEndFrame();
 static void             UpdateSettings();
 static int              UpdateWindowManualResize(ImGuiWindow* window, const ImVec2& size_auto_fit, int* border_hovered, int* border_held, int resize_grip_count, ImU32 resize_grip_col[4], const ImRect& visibility_rect);
+static void             RenderWindowShadow(ImGuiWindow* window);
 static void             RenderWindowOuterBorders(ImGuiWindow* window);
 static void             RenderWindowDecorations(ImGuiWindow* window, const ImRect& title_bar_rect, bool title_bar_is_highlight, bool handle_borders_and_resize_grips, int resize_grip_count, const ImU32 resize_grip_col[4], float resize_grip_draw_size);
 static void             RenderWindowTitleBarContents(ImGuiWindow* window, const ImRect& title_bar_rect, const char* name, bool* p_open);
@@ -1435,6 +1436,9 @@ ImGuiStyle::ImGuiStyle()
     AntiAliasedFill             = true;             // Enable anti-aliased filled shapes (rounded rectangles, circles, etc.).
     CurveTessellationTol        = 1.25f;            // Tessellation tolerance when using PathBezierCurveTo() without a specific number of segments. Decrease for highly tessellated curves (higher quality, more polygons), increase to reduce quality.
     CircleTessellationMaxError  = 0.30f;            // Maximum error (in pixels) allowed when using AddCircle()/AddCircleFilled() or drawing rounded corner rectangles with no explicit segment count specified. Decrease for higher quality but more geometry.
+    WindowShadowSize            = 100.0f;           // Size (in pixels) of window shadows.
+    WindowShadowOffsetDist      = 0.0f;             // Offset distance (in pixels) of window shadows from casting window.
+    WindowShadowOffsetAngle     = IM_PI * 0.25f;    // Offset angle of window shadows from casting window (0.0f = left, 0.5f*PI = bottom, 1.0f*PI = right, 1.5f*PI = top).
 
     // Behaviors
     HoverStationaryDelay        = 0.15f;            // Delay for IsItemHovered(ImGuiHoveredFlags_Stationary). Time required to consider mouse stationary.
@@ -3657,6 +3661,7 @@ const char* ImGui::GetStyleColorName(ImGuiCol idx)
     case ImGuiCol_NavWindowingHighlight: return "NavWindowingHighlight";
     case ImGuiCol_NavWindowingDimBg: return "NavWindowingDimBg";
     case ImGuiCol_ModalWindowDimBg: return "ModalWindowDimBg";
+    case ImGuiCol_WindowShadow: return "WindowShadow";
     }
     IM_ASSERT(0);
     return "Unknown";
@@ -6993,6 +6998,11 @@ void ImGui::RenderWindowDecorations(ImGuiWindow* window, const ImRect& title_bar
             window->DrawList->AddRectFilled(window->Pos + ImVec2(0, window->TitleBarHeight), window->Pos + window->Size, bg_col, window_rounding, (flags & ImGuiWindowFlags_NoTitleBar) ? 0 : ImDrawFlags_RoundCornersBottom);
         }
 
+        // Draw window shadow
+        if (style.WindowShadowSize > 0.0f && (!(flags & ImGuiWindowFlags_ChildWindow) || (flags & ImGuiWindowFlags_Popup)))
+            if (style.Colors[ImGuiCol_WindowShadow].w > 0.0f)
+                RenderWindowShadow(window);
+
         // Title bar
         if (!(flags & ImGuiWindowFlags_NoTitleBar))
         {
@@ -7039,6 +7049,16 @@ void ImGui::RenderWindowDecorations(ImGuiWindow* window, const ImRect& title_bar
             RenderWindowOuterBorders(window);
     }
     window->DC.NavLayerCurrent = ImGuiNavLayer_Main;
+}
+
+void ImGui::RenderWindowShadow(ImGuiWindow* window)
+{
+    ImGuiContext& g = *GImGui;
+    ImGuiStyle& style = g.Style;
+    float shadow_size = style.WindowShadowSize;
+    ImU32 shadow_col = GetColorU32(ImGuiCol_WindowShadow);
+    ImVec2 shadow_offset = ImVec2(ImCos(style.WindowShadowOffsetAngle), ImSin(style.WindowShadowOffsetAngle)) * style.WindowShadowOffsetDist;
+    window->DrawList->AddShadowRect(window->Pos, window->Pos + window->Size, shadow_col, shadow_size, shadow_offset, ImDrawFlags_ShadowCutOutShapeBackground, window->WindowRounding);
 }
 
 // Render title text, collapse button, close button
@@ -8024,6 +8044,58 @@ void ImGui::End()
 
     g.CurrentWindowStack.pop_back();
     SetCurrentWindow(g.CurrentWindowStack.Size == 0 ? NULL : g.CurrentWindowStack.back().Window);
+}
+
+// Important: this alone doesn't alter current ImDrawList state. This is called by PushFont/PopFont only.
+void ImGui::SetCurrentFont(ImFont* font)
+{
+    ImGuiContext& g = *GImGui;
+    IM_ASSERT(font && font->IsLoaded());    // Font Atlas not created. Did you call io.Fonts->GetTexDataAsRGBA32 / GetTexDataAsAlpha8 ?
+    IM_ASSERT(font->Scale > 0.0f);
+    g.Font = font;
+    g.FontBaseSize = ImMax(1.0f, g.IO.FontGlobalScale * g.Font->FontSize * g.Font->Scale);
+    g.FontSize = g.CurrentWindow ? g.CurrentWindow->CalcFontSize() : 0.0f;
+    g.FontScale = g.FontSize / g.Font->FontSize;
+
+    ImFontAtlas* atlas = g.Font->ContainerAtlas;
+    g.DrawListSharedData.TexUvWhitePixel = atlas->TexUvWhitePixel;
+    g.DrawListSharedData.TexUvLines = atlas->TexUvLines;
+    g.DrawListSharedData.Font = g.Font;
+    g.DrawListSharedData.FontSize = g.FontSize;
+    g.DrawListSharedData.FontScale = g.FontScale;
+    g.DrawListSharedData.ShadowRectIds = &atlas->ShadowRectIds[0];
+    g.DrawListSharedData.ShadowRectUvs = &atlas->ShadowRectUvs[0];
+}
+
+// Use ImDrawList::_SetTextureID(), making our shared g.FontStack[] authorative against window-local ImDrawList.
+// - Whereas ImDrawList::PushTextureID()/PopTextureID() is not to be used across Begin() calls.
+// - Note that we don't propagate current texture id when e.g. Begin()-ing into a new window, we never really did...
+//   - Some code paths never really fully worked with multiple atlas textures.
+//   - The right-ish solution may be to remove _SetTextureID() and make AddText/RenderText lazily call PushTextureID()/PopTextureID()
+//     the same way AddImage() does, but then all other primitives would also need to? I don't think we should tackle this problem
+//     because we have a concrete need and a test bed for multiple atlas textures.
+void ImGui::PushFont(ImFont* font)
+{
+    ImGuiContext& g = *GImGui;
+    if (font == NULL)
+        font = GetDefaultFont();
+    g.FontStack.push_back(font);
+    SetCurrentFont(font);
+    g.CurrentWindow->DrawList->_SetTextureID(font->ContainerAtlas->TexID);
+}
+
+void  ImGui::PopFont()
+{
+    ImGuiContext& g = *GImGui;
+    if (g.FontStack.Size <= 0)
+    {
+        IM_ASSERT_USER_ERROR(0, "Calling PopFont() too many times!");
+        return;
+    }
+    g.FontStack.pop_back();
+    ImFont* font = g.FontStack.Size == 0 ? GetDefaultFont() : g.FontStack.back();
+    SetCurrentFont(font);
+    g.CurrentWindow->DrawList->_SetTextureID(font->ContainerAtlas->TexID);
 }
 
 void ImGui::PushItemFlag(ImGuiItemFlags option, bool enabled)
